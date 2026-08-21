@@ -8,7 +8,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// ── state files (all in ~/.cache/) ───────────────────────────────────────────
 // wall_cfg    →  line 1: "WIDTH HEIGHT"   line 2: "/walls/dir"
 // wall_queue  →  pre-shuffled paths, one per line; pop front each run
 
@@ -68,9 +67,6 @@ fn load_cfg() -> Cfg {
     Cfg { screen_w: w, screen_h: h, walls_dir }
 }
 
-// ── non-repeat queue ──────────────────────────────────────────────────────────
-// Pre-shuffled list of all wallpaper paths. Each run pops the first entry.
-// When the file is empty, rebuild it with a fresh shuffle of everything.
 
 fn all_wallpapers(dir: &Path) -> Vec<PathBuf> {
     walkdir::WalkDir::new(dir)
@@ -135,7 +131,6 @@ fn pick_wallpaper(walls_dir: &Path) -> Option<PathBuf> {
     Some(chosen)
 }
 
-// ── image processing ──────────────────────────────────────────────────────────
 
 /// object-fit: cover — scale to fill screen, center-crop the excess.
 fn cover_fit(iw: u32, ih: u32, sw: u32, sh: u32) -> (u32, u32, u32, u32) {
@@ -175,7 +170,6 @@ fn process(
     }))
 }
 
-// ── set wallpaper ─────────────────────────────────────────────────────────────
 
 fn set_wallpaper(img: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<(), Box<dyn std::error::Error>> {
     let tmp = cache_dir().join("wall_tmp.png");
@@ -186,7 +180,6 @@ fn set_wallpaper(img: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-// ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
     let cfg = load_cfg();
