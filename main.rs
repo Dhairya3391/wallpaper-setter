@@ -1,122 +1,78 @@
 use fast_image_resize as fr;
 use fast_image_resize::images::Image;
 use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions};
-use image::{GenericImageView, ImageBuffer, Rgb, imageops};
+use image::{imageops, GenericImageView, ImageBuffer, Rgb};
 use rand::seq::SliceRandom;
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{BufReader, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const CONFIG_FILE: &str = ".config/wallpaper_manager.json";
+// ── state files (all in ~/.cache/) ───────────────────────────────────────────
+// wall_cfg    →  line 1: "WIDTH HEIGHT"   line 2: "/walls/dir"
+// wall_queue  →  pre-shuffled paths, one per line; pop front each run
 
-#[derive(Serialize, Deserialize, Default)]
-struct Config {
-    used_wallpapers: HashSet<String>,
-    current_wallpaper: Option<String>,
-    wallpaper_dir: Option<String>,
-    screen_width: Option<u32>,
-    screen_height: Option<u32>,
+fn cache_dir() -> PathBuf {
+    dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().unwrap().join(".cache"))
 }
 
-fn load_config() -> Config {
-    dirs::home_dir()
-        .and_then(|home| File::open(home.join(CONFIG_FILE)).ok())
-        .map(|file| serde_json::from_reader(BufReader::new(file)).unwrap_or_default())
-        .unwrap_or_default()
-}
-
-fn save_config(config: &Config) {
-    if let Some(path) = dirs::home_dir().map(|h| h.join(CONFIG_FILE)) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(file) = File::create(path) {
-            let _ = serde_json::to_writer(file, config);
-        }
-    }
-}
-
-fn prompt(question: &str) -> String {
-    print!("{question} ");
+fn prompt(q: &str) -> String {
+    print!("{q} ");
     std::io::stdout().flush().ok();
-    let mut buf = String::new();
-    std::io::stdin().read_line(&mut buf).ok();
-    buf.trim().to_owned()
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).ok();
+    s.trim().to_owned()
 }
 
-// ── screen size ──────────────────────────────────────────────────────────────
+// ── config ────────────────────────────────────────────────────────────────────
 
-fn detect_from_fb0_modes() -> Option<(u32, u32)> {
-    let raw = fs::read_to_string("/sys/class/graphics/fb0/modes").ok()?;
-    let line = raw.lines().next()?;
-    let res = line.split(':').nth(1)?.split('-').next()?;
-    let mut dims = res.split('x');
-    let w: u32 = dims.next()?.trim().parse().ok()?;
-    let h: u32 = dims.next()?.trim().parse().ok()?;
-    Some((w, h))
+struct Cfg {
+    screen_w: u32,
+    screen_h: u32,
+    walls_dir: PathBuf,
 }
 
-fn detect_from_fb0() -> Option<(u32, u32)> {
-    let raw = fs::read_to_string("/sys/class/graphics/fb0/virtual_size").ok()?;
-    let mut parts = raw.trim().splitn(2, ',');
-    let w: u32 = parts.next()?.trim().parse().ok()?;
-    let h: u32 = parts.next()?.trim().parse().ok()?;
-    let h = if h > w * 4 { h / 2 } else { h };
-    Some((w, h))
-}
+fn load_cfg() -> Cfg {
+    let cfg_file = cache_dir().join("wall_cfg");
 
-fn get_screen_size(config: &mut Config) -> (u32, u32) {
-    if let (Some(w), Some(h)) = (config.screen_width, config.screen_height) {
-        return (w, h);
-    }
-
-    let detected = detect_from_fb0_modes().or_else(detect_from_fb0);
-
-    let (w, h) = if let Some(dims @ (w, h)) = detected {
-        if w >= 100 && h >= 100 {
-            dims
-        } else {
-            eprintln!("Detected implausible resolution ({w}x{h}), please enter manually.");
-            let w: u32 = prompt("Screen width (px):").parse().unwrap_or(1080);
-            let h: u32 = prompt("Screen height (px):").parse().unwrap_or(2400);
-            (w, h)
+    if let Ok(f) = fs::File::open(&cfg_file) {
+        let mut lines = BufReader::new(f).lines().map_while(Result::ok);
+        let dims = lines.next().unwrap_or_default();
+        let dir  = lines.next().unwrap_or_default();
+        let mut parts = dims.splitn(2, ' ');
+        let w: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let h: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        if w > 0 && h > 0 && !dir.is_empty() {
+            return Cfg { screen_w: w, screen_h: h, walls_dir: PathBuf::from(dir) };
         }
-    } else {
-        println!("Could not detect screen resolution automatically.");
-        let w: u32 = prompt("Screen width (px):").parse().unwrap_or(1080);
-        let h: u32 = prompt("Screen height (px):").parse().unwrap_or(2400);
-        (w, h)
-    };
-
-    config.screen_width = Some(w);
-    config.screen_height = Some(h);
-    (w, h)
-}
-
-// ── wallpaper directory ───────────────────────────────────────────────────────
-
-fn get_wallpaper_dir(config: &mut Config) -> PathBuf {
-    if let Some(dir) = &config.wallpaper_dir {
-        return PathBuf::from(dir);
     }
 
-    let input = prompt("Wallpaper directory path:");
-    let path = if input.starts_with('~') {
+    // first run
+    let w: u32 = prompt("Screen width  (px):").parse().unwrap_or(1080);
+    let h: u32 = prompt("Screen height (px):").parse().unwrap_or(2400);
+    let raw = prompt("Wallpaper directory:");
+    let walls_dir = if raw.starts_with('~') {
         dirs::home_dir()
-            .map(|h| h.join(input.trim_start_matches("~/")))
-            .unwrap_or_else(|| PathBuf::from(&input))
+            .map(|home| home.join(raw.trim_start_matches("~/")))
+            .unwrap_or_else(|| PathBuf::from(&raw))
     } else {
-        PathBuf::from(&input)
+        PathBuf::from(&raw)
     };
 
-    config.wallpaper_dir = Some(path.to_string_lossy().into_owned());
-    path
+    let _ = fs::create_dir_all(cache_dir());
+    if let Ok(mut f) = fs::File::create(&cfg_file) {
+        let _ = writeln!(f, "{w} {h}");
+        let _ = writeln!(f, "{}", walls_dir.display());
+    }
+
+    Cfg { screen_w: w, screen_h: h, walls_dir }
 }
 
-fn get_all_wallpapers(dir: &Path) -> Vec<PathBuf> {
+// ── non-repeat queue ──────────────────────────────────────────────────────────
+// Pre-shuffled list of all wallpaper paths. Each run pops the first entry.
+// When the file is empty, rebuild it with a fresh shuffle of everything.
+
+fn all_wallpapers(dir: &Path) -> Vec<PathBuf> {
     walkdir::WalkDir::new(dir)
         .into_iter()
         .filter_map(Result::ok)
@@ -132,115 +88,117 @@ fn get_all_wallpapers(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-// ── image processing ──────────────────────────────────────────────────────────
+fn pick_wallpaper(walls_dir: &Path) -> Option<PathBuf> {
+    let queue_path = cache_dir().join("wall_queue");
 
-/// CSS object-fit:cover — scale so image fills the screen, center-crop the excess.
-fn cover_fit(img_w: u32, img_h: u32, screen_w: u32, screen_h: u32) -> (u32, u32, u32, u32) {
-    let scale = (screen_w as f64 / img_w as f64).max(screen_h as f64 / img_h as f64);
-    let scaled_w = (img_w as f64 * scale).round() as u32;
-    let scaled_h = (img_h as f64 * scale).round() as u32;
-    let crop_x = (scaled_w.saturating_sub(screen_w)) / 2;
-    let crop_y = (scaled_h.saturating_sub(screen_h)) / 2;
-    (scaled_w, scaled_h, crop_x, crop_y)
+    // Try to pop the first line from the queue
+    if let Ok(f) = fs::File::open(&queue_path) {
+        let mut lines: Vec<String> = BufReader::new(f)
+            .lines()
+            .filter_map(Result::ok)
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        if !lines.is_empty() {
+            let chosen = PathBuf::from(lines.remove(0));
+            // Rewrite queue without the consumed entry
+            if let Ok(mut f) = fs::File::create(&queue_path) {
+                for l in &lines {
+                    let _ = writeln!(f, "{l}");
+                }
+            }
+            return Some(chosen);
+        }
+    }
+
+    // Queue empty or missing — rebuild with a fresh shuffle
+    let mut all = all_wallpapers(walls_dir);
+    if all.is_empty() {
+        return None;
+    }
+    all.shuffle(&mut rand::thread_rng());
+
+    let chosen = all.remove(0);
+
+    let _ = fs::create_dir_all(cache_dir());
+    if let Ok(mut f) = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&queue_path)
+    {
+        for p in &all {
+            let _ = writeln!(f, "{}", p.display());
+        }
+    }
+
+    Some(chosen)
 }
 
-fn process_wallpaper(
-    input_path: &Path,
-    screen_w: u32,
-    screen_h: u32,
+// ── image processing ──────────────────────────────────────────────────────────
+
+/// object-fit: cover — scale to fill screen, center-crop the excess.
+fn cover_fit(iw: u32, ih: u32, sw: u32, sh: u32) -> (u32, u32, u32, u32) {
+    let scale = (sw as f64 / iw as f64).max(sh as f64 / ih as f64);
+    let scaled_w = (iw as f64 * scale).round() as u32;
+    let scaled_h = (ih as f64 * scale).round() as u32;
+    let cx = (scaled_w.saturating_sub(sw)) / 2;
+    let cy = (scaled_h.saturating_sub(sh)) / 2;
+    (scaled_w, scaled_h, cx, cy)
+}
+
+fn process(
+    path: &Path,
+    sw: u32,
+    sh: u32,
 ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>, Box<dyn std::error::Error>> {
-    let img = image::open(input_path)?;
-    let (img_w, img_h) = img.dimensions();
-    let (scaled_w, scaled_h, crop_x, crop_y) = cover_fit(img_w, img_h, screen_w, screen_h);
+    let img = image::open(path)?;
+    let (iw, ih) = img.dimensions();
+    let (scaled_w, scaled_h, cx, cy) = cover_fit(iw, ih, sw, sh);
 
-    let rgba = img.to_rgba8();
-    let src = Image::from_vec_u8(img_w, img_h, rgba.into_raw(), fr::PixelType::U8x4)?;
+    let src = Image::from_vec_u8(iw, ih, img.to_rgba8().into_raw(), fr::PixelType::U8x4)?;
     let mut dst = Image::new(scaled_w, scaled_h, fr::PixelType::U8x4);
+    fr::Resizer::new().resize(
+        &src,
+        &mut dst,
+        &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3)),
+    )?;
 
-    let mut resizer = fr::Resizer::new();
-    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3));
-    resizer.resize(&src, &mut dst, &options)?;
-
-    let rgba_img: image::RgbaImage =
+    let rgba: image::RgbaImage =
         image::ImageBuffer::from_raw(scaled_w, scaled_h, dst.into_vec())
             .ok_or("buffer size mismatch")?;
+    let cropped = imageops::crop_imm(&rgba, cx, cy, sw, sh).to_image();
 
-    let cropped = imageops::crop_imm(&rgba_img, crop_x, crop_y, screen_w, screen_h).to_image();
-
-    Ok(ImageBuffer::from_fn(screen_w, screen_h, |x, y| {
+    Ok(ImageBuffer::from_fn(sw, sh, |x, y| {
         let p = cropped.get_pixel(x, y);
         Rgb([p[0], p[1], p[2]])
     }))
 }
 
-// ── wallpaper application ─────────────────────────────────────────────────────
+// ── set wallpaper ─────────────────────────────────────────────────────────────
 
-fn set_wallpaper(image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<(), Box<dyn std::error::Error>> {
-    let tmp = std::env::temp_dir().join("wallpaper_tmp.png");
-    image.save(&tmp)?;
-
-    let run = |extra: &[&str]| {
-        Command::new("termux-wallpaper")
-            .arg("-f")
-            .arg(&tmp)
-            .args(extra)
-            .status()
-    };
-    run(&[])?;
-    run(&["-l"])?;
-
-    let _ = fs::remove_file(&tmp);
+fn set_wallpaper(img: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = cache_dir().join("wall_tmp.png");
+    img.save(&tmp)?;
+    // Both commands reference the same file → identical image on home + lock
+    Command::new("termux-wallpaper").arg("-f").arg(&tmp).status()?;
+    Command::new("termux-wallpaper").arg("-f").arg(&tmp).arg("-l").status()?;
     Ok(())
-}
-
-// ── selection ─────────────────────────────────────────────────────────────────
-
-fn pick_wallpaper(config: &mut Config, dir: &Path) -> Option<PathBuf> {
-    let all = get_all_wallpapers(dir);
-    if all.is_empty() {
-        return None;
-    }
-
-    let mut rng = rand::thread_rng();
-    let key = |p: &PathBuf| p.to_string_lossy().into_owned();
-
-    let unused: Vec<_> = all
-        .iter()
-        .filter(|p| !config.used_wallpapers.contains(&key(p)))
-        .cloned()
-        .collect();
-
-    let chosen = if unused.is_empty() {
-        config.used_wallpapers.clear();
-        all.choose(&mut rng).cloned()
-    } else {
-        unused.choose(&mut rng).cloned()
-    }?;
-
-    config.used_wallpapers.insert(key(&chosen));
-    config.current_wallpaper = Some(key(&chosen));
-    Some(chosen)
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    let mut config = load_config();
+    let cfg = load_cfg();
 
-    let (screen_w, screen_h) = get_screen_size(&mut config);
-    let dir = get_wallpaper_dir(&mut config);
-
-    let Some(path) = pick_wallpaper(&mut config, &dir) else {
-        eprintln!("No wallpapers found in {}", dir.display());
+    let Some(path) = pick_wallpaper(&cfg.walls_dir) else {
+        eprintln!("No wallpapers found in {}", cfg.walls_dir.display());
         std::process::exit(1);
     };
 
-    match process_wallpaper(&path, screen_w, screen_h) {
+    match process(&path, cfg.screen_w, cfg.screen_h) {
         Ok(img) => match set_wallpaper(&img) {
-            Ok(()) => {
-                save_config(&config);
-                println!("OK  {}  ({}x{})", path.display(), screen_w, screen_h);
-            }
+            Ok(()) => println!("OK  {}", path.display()),
             Err(e) => eprintln!("set_wallpaper: {e}"),
         },
         Err(e) => eprintln!("process {:?}: {e}", path),
