@@ -150,14 +150,14 @@ mode = "smart"
 # Categories to exclude (case-insensitive).
 # Official categories available on WallWidgy:
 #   abstract, amoled, anime, architecture, art, cars, minimal, nature, tech
-blacklist = []
+blacklist = ["abstract"]
 
 # Preferred categories for random mode (60% chance to pick from these).
-priority = ["minimal", "amoled", "art"]
+priority = ["anime", "nature"]
 
-# Preferred colors for random mode (e.g. "blue", "purple", "neon", "black").
+# Preferred colors for random mode.
 # Run `wall --colors` to see all 39 supported colors.
-colors = []
+colors = ["blue", "red", "white", "black", "purple", "green", "gray"]
 
 # Colors to exclude completely (case-insensitive).
 blacklist_colors = []

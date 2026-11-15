@@ -6,6 +6,7 @@ mod api;
 mod config;
 mod image_proc;
 mod setter;
+mod update;
 
 use api::WallpaperEntry;
 use clap::Parser;
@@ -58,6 +59,10 @@ struct Cli {
     /// Display current active settings (screen size, fit mode, priorities, blacklist).
     #[arg(long = "info")]
     info: bool,
+
+    /// Update wall to the latest release directly from GitHub in-place.
+    #[arg(short = 'u', long = "update")]
+    update: bool,
 
     /// Use local wallpaper folder instead of online WallWidgy source.
     #[arg(long = "local")]
@@ -398,6 +403,16 @@ fn main() -> ExitCode {
     if cli.show_config {
         println!("{}", config::config_path().display());
         return ExitCode::SUCCESS;
+    }
+
+    if cli.update {
+        return match update::update() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("Update error: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     if cli.reset_config {

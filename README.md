@@ -63,6 +63,10 @@ wall --colors
 # View active configuration and screen resolution
 wall --info
 
+# Self-update to the latest release in-place directly from GitHub
+wall -u
+# or: wall --update
+
 # Reset config.toml to the default template
 wall --reset-config
 
@@ -93,13 +97,13 @@ mode = "smart"
 
 [filter]
 # Categories to exclude (case-insensitive)
-blacklist = ["cars"]
+blacklist = ["abstract"]
 
 # Preferred categories for random mode (60% chance to pick from these)
-priority = ["minimal", "amoled", "art"]
+priority = ["anime", "nature"]
 
-# Preferred colors for random mode (e.g. "blue", "purple", "black")
-colors = ["blue"]
+# Preferred colors for random mode
+colors = ["blue", "red", "white", "black", "purple", "green", "gray"]
 
 # Colors to exclude completely
 blacklist_colors = []
