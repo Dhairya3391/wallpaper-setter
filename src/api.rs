@@ -305,10 +305,22 @@ pub fn random_many(count: u32) -> Result<Vec<WallpaperEntry>, String> {
     query(None, None, count)
 }
 
-/// Search wallpapers by keyword or phrase.
-pub fn search(query: &str, count: u32) -> Result<Vec<WallpaperEntry>, String> {
-    let encoded = query.replace(' ', "%20");
-    let url = format!("{BASE}/wallpapers/search?q={encoded}&count={count}");
+/// Percent-encode a term for safe use in a query string (spaces, quotes, `&`, non-ASCII, ...).
+fn encode_query(term: &str) -> String {
+    let mut out = String::with_capacity(term.len());
+    for byte in term.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn search_single(term: &str, count: u32) -> Result<Vec<WallpaperEntry>, String> {
+    let url = format!("{BASE}/wallpapers/search?q={}&count={count}", encode_query(term));
 
     let resp = match agent().get(&url).call() {
         Ok(r) => r,
@@ -321,9 +333,108 @@ pub fn search(query: &str, count: u32) -> Result<Vec<WallpaperEntry>, String> {
         .map_err(|e| format!("Failed to parse search response: {e}"))?;
 
     // Prefer mobile results if available
-    let (mut mobile, desktop): (Vec<_>, Vec<_>) = wrapper.wallpapers.into_iter().partition(|w| w.is_mobile());
+    let (mut mobile, desktop): (Vec<_>, Vec<_>) =
+        wrapper.wallpapers.into_iter().partition(|w| w.is_mobile());
     mobile.extend(desktop);
     Ok(mobile)
+}
+
+/// Generate candidate search terms for a query, ordered by likelihood of a hit.
+/// WallWidgy indexes hyphenated names and tags, so a multi-word query is first
+/// collapsed to its hyphenated form: "one piece" -> "one-piece".
+fn search_candidates(query: &str) -> Vec<String> {
+    let joined = query.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let trimmed = joined.trim_matches(|c| c == '\'' || c == '"').trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let q = trimmed.to_string();
+    if q.contains(' ') {
+        vec![q.replace(' ', "-"), q.clone(), q.replace(' ', "")]
+    } else {
+        vec![q]
+    }
+}
+
+/// Search wallpapers by keyword or phrase (e.g. "one piece" or "luffy").
+/// Tries hyphenated, spaced, and joined variants, then falls back to the
+/// individual words (longest first) for queries like "monkey d luffy".
+pub fn search(query: &str, count: u32) -> Result<Vec<WallpaperEntry>, String> {
+    let candidates = search_candidates(query);
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut last_err: Option<String> = None;
+    for candidate in &candidates {
+        match search_single(candidate, count) {
+            Ok(results) if !results.is_empty() => return Ok(results),
+            Ok(_) => {}
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    // Last resort for multi-word queries: search the individual words,
+    // longest first, skipping tiny words. E.g. "monkey d luffy" -> "monkey", "luffy".
+    let mut words: Vec<&str> = query.split_whitespace().collect();
+    if words.len() > 1 {
+        words.retain(|w| w.chars().count() > 2);
+        words.sort_by_key(|w| std::cmp::Reverse(w.len()));
+        words.dedup();
+        for word in words {
+            match search_single(word, count) {
+                Ok(results) if !results.is_empty() => return Ok(results),
+                Ok(_) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+    }
+
+    // Surface a network/parse failure instead of a misleading "no results".
+    match last_err {
+        Some(e) => Err(e),
+        None => Ok(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidates_multi_word_tries_hyphenated_first() {
+        assert_eq!(search_candidates("One Piece"), vec!["one-piece", "one piece", "onepiece"]);
+    }
+
+    #[test]
+    fn candidates_single_word_unchanged() {
+        assert_eq!(search_candidates("  Luffy  "), vec!["luffy"]);
+    }
+
+    #[test]
+    fn candidates_empty_query() {
+        assert!(search_candidates("   ").is_empty());
+    }
+
+    #[test]
+    fn candidates_strips_surrounding_quotes() {
+        assert_eq!(search_candidates("\"one piece\""), vec!["one-piece", "one piece", "onepiece"]);
+        assert_eq!(search_candidates("'luffy'"), vec!["luffy"]);
+    }
+
+    #[test]
+    fn candidates_normalizes_inner_whitespace() {
+        assert_eq!(search_candidates("monkey\t d\nluffy"), vec!["monkey-d-luffy", "monkey d luffy", "monkeydluffy"]);
+    }
+
+    #[test]
+    fn encode_query_escapes_specials_but_keeps_hyphens() {
+        assert_eq!(encode_query("one piece"), "one%20piece");
+        assert_eq!(encode_query("one-piece"), "one-piece");
+        assert_eq!(encode_query("zoro & sanji"), "zoro%20%26%20sanji");
+        assert_eq!(encode_query("\"quoted\""), "%22quoted%22");
+        assert_eq!(encode_query("luffy.is#1"), "luffy.is%231");
+    }
 }
 
 /// Fetch available colors from the API or fallback to official palette.

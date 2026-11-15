@@ -33,8 +33,8 @@ struct Cli {
     color: Option<String>,
 
     /// Search for a wallpaper by keyword or title (first match is selected).
-    #[arg(short = 's', long = "search", value_name = "QUERY")]
-    search: Option<String>,
+    #[arg(short = 's', long = "search", num_args(1..), value_name = "QUERY")]
+    search: Option<Vec<String>>,
 
     /// List all categories and colors with priority and blacklist status.
     #[arg(short = 'l', long = "list")]
@@ -472,7 +472,9 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let result = if let Some(ref query) = cli.search {
+    let search_query = cli.search.map(|words| words.join(" "));
+
+    let result = if let Some(ref query) = search_query {
         run_search(query, cli.color.as_deref(), &cfg, cli.count, cli.dry_run)
     } else if cli.local {
         run_local(&cfg, cli.dry_run)
