@@ -241,6 +241,12 @@ impl WallpaperEntry {
         }
     }
 
+    /// Whether the wallpaper lists the given color among its primary colors.
+    pub fn has_primary_color(&self, color: &str) -> bool {
+        let needle = color.to_lowercase();
+        self.primary_colors().iter().any(|c| c.to_lowercase() == needle)
+    }
+
     /// Check if wallpaper matches a specific color name.
     pub fn matches_color(&self, color: &str) -> bool {
         let needle = color.to_lowercase();
@@ -314,6 +320,61 @@ pub fn query(
         .map_err(|e| format!("Failed to parse wallpapers response: {e}"))?;
 
     Ok(wrapper.wallpapers)
+}
+
+/// Build a candidate pool for a category/color filter.
+///
+/// The plain `/wallpapers` filter endpoint returns very few results (e.g. a
+/// single wallpaper for `color=black`), which makes repeat avoidance useless.
+/// Prefer the search endpoint — it carries color metadata and a much larger
+/// pool — then filter locally. Falls back to the plain endpoint if search has
+/// nothing usable.
+pub fn filtered(
+    category: Option<&str>,
+    color: Option<&str>,
+    count: u32,
+) -> Result<Vec<WallpaperEntry>, String> {
+    if let Some(c) = color {
+        let needle = c.trim().to_lowercase();
+        if !needle.is_empty() {
+            if let Ok(results) = search(&needle, count) {
+                let exact: Vec<WallpaperEntry> = results
+                    .iter()
+                    .filter(|w| w.has_primary_color(&needle))
+                    .cloned()
+                    .collect();
+                let mut pool = if exact.is_empty() {
+                    results
+                        .into_iter()
+                        .filter(|w| w.matches_color(&needle))
+                        .collect()
+                } else {
+                    exact
+                };
+
+                if let Some(cat) = category {
+                    let by_category: Vec<WallpaperEntry> = pool
+                        .iter()
+                        .filter(|w| {
+                            w.category()
+                                .as_deref()
+                                .is_some_and(|wc| wc.eq_ignore_ascii_case(cat))
+                        })
+                        .cloned()
+                        .collect();
+                    if !by_category.is_empty() {
+                        pool = by_category;
+                    }
+                }
+
+                if !pool.is_empty() {
+                    return Ok(pool);
+                }
+            }
+        }
+    }
+
+    query(category, color, count)
 }
 
 /// Fetch random mobile wallpapers using the dedicated random API.
@@ -453,6 +514,19 @@ mod tests {
     #[test]
     fn candidates_normalizes_inner_whitespace() {
         assert_eq!(search_candidates("monkey\t d\nluffy"), vec!["monkey-d-luffy", "monkey d luffy", "monkeydluffy"]);
+    }
+
+    #[test]
+    fn has_primary_color_is_strict() {
+        let entry: WallpaperEntry = serde_json::from_str(
+            r#"{
+                "file_name": "x",
+                "data": { "primary_colors": ["black", "gray"], "tags": ["neon", "dark"] }
+            }"#,
+        )
+        .unwrap();
+        assert!(entry.has_primary_color("Black"));
+        assert!(!entry.has_primary_color("neon"));
     }
 
     #[test]

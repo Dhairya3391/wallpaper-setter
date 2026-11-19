@@ -108,7 +108,7 @@ fn run_category(
     }
     eprintln!("...");
 
-    let walls = api::query(Some(cat), color, count)?;
+    let walls = api::filtered(Some(cat), color, count)?;
     if walls.is_empty() {
         if let Some(c) = color {
             return Err(format!("No wallpapers found for category '{cat}' with color '{c}'"));
@@ -133,7 +133,7 @@ fn run_color(
     }
 
     eprintln!("Fetching wallpapers with color: {color}...");
-    let mut walls = api::query(None, Some(color), count)?;
+    let mut walls = api::filtered(None, Some(color), count)?;
     walls.retain(|w| {
         if let Some(c) = w.category() {
             !cfg.is_blacklisted(&c)
@@ -218,7 +218,7 @@ fn run_random(
                 }
                 eprintln!();
 
-                if let Ok(walls) = api::query(cat, col, count) {
+                if let Ok(walls) = api::filtered(cat, col, count) {
                     let filtered: Vec<_> = walls
                         .into_iter()
                         .filter(|w| {
@@ -274,16 +274,18 @@ fn run_local(cfg: &Config, dry_run: bool, history: &mut history::History) -> Res
     let chosen = if let Some(p) = unseen.choose(&mut rng) {
         Some(*p)
     } else {
-        eprintln!("  ↻ All local wallpapers already applied; recycling older ones.");
         let last = history.last().unwrap_or("");
         let recycled: Vec<&std::path::PathBuf> = walls
             .iter()
             .filter(|p| local_id(p) != last)
             .collect();
-        recycled
-            .choose(&mut rng)
-            .copied()
-            .or_else(|| walls.first())
+        if recycled.is_empty() {
+            eprintln!("  ↻ No unseen local wallpapers; reapplying the only candidate.");
+            walls.first()
+        } else {
+            eprintln!("  ↻ All local wallpapers already applied; recycling older ones.");
+            recycled.choose(&mut rng).copied()
+        }
     };
 
     let path = chosen.ok_or("Empty pool")?;
@@ -383,19 +385,18 @@ fn pick_unseen<R: Rng>(
         return Some(pick.clone());
     }
 
-    eprintln!("  ↻ All candidates already applied; recycling older wallpapers.");
     let last = history.last().unwrap_or("");
     let first = walls.first().cloned();
     let recycled: Vec<WallpaperEntry> = walls
         .into_iter()
         .filter(|w| w.id() != last)
         .collect();
-    if let Some(pick) = recycled.choose(rng) {
-        return Some(pick.clone());
+    if recycled.is_empty() {
+        eprintln!("  ↻ No unseen wallpapers in this pool; reapplying the only candidate.");
+        return first;
     }
-
-    eprintln!("  ↻ Only one candidate available; reapplying it. Use --reset-history to start fresh.");
-    first
+    eprintln!("  ↻ All candidates already applied; recycling older wallpapers.");
+    recycled.choose(rng).cloned()
 }
 
 /// Stable key for a local wallpaper file.
