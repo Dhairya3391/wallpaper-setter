@@ -2,6 +2,7 @@
 //! Always requests mobile-oriented wallpapers for Android/Termux.
 
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::io::Read;
 use std::time::Duration;
 
@@ -22,6 +23,12 @@ pub const OFFICIAL_CATEGORIES: &[&str] = &[
     "minimal",
     "nature",
     "tech",
+];
+
+/// Mood values seen in WallWidgy wallpaper metadata.
+pub const MOODS: &[&str] = &[
+    "bright", "calm", "cheerful", "dark", "dramatic", "dreamy", "energetic",
+    "intense", "melancholic", "mysterious", "peaceful", "playful", "serious",
 ];
 
 /// Official WallWidgy color palette.
@@ -277,6 +284,47 @@ impl WallpaperEntry {
     }
 }
 
+/// User-supplied color/mood criteria shared by all selection modes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Filters<'a> {
+    pub colors: &'a [String],
+    pub moods: &'a [String],
+    /// `true` requires every listed color to match (AND), `false` requires any (OR).
+    pub match_all: bool,
+}
+
+impl Filters<'_> {
+    fn color_ok(&self, wall: &WallpaperEntry, loose: bool) -> bool {
+        if self.colors.is_empty() {
+            return true;
+        }
+        let matches = |c: &String| {
+            if loose {
+                wall.matches_color(c)
+            } else {
+                wall.has_primary_color(c)
+            }
+        };
+        if self.match_all {
+            self.colors.iter().all(matches)
+        } else {
+            self.colors.iter().any(matches)
+        }
+    }
+
+    fn mood_ok(&self, wall: &WallpaperEntry) -> bool {
+        if self.moods.is_empty() {
+            return true;
+        }
+        wall.mood()
+            .is_some_and(|m| self.moods.iter().any(|x| x.eq_ignore_ascii_case(m)))
+    }
+
+    pub fn matches(&self, wall: &WallpaperEntry, loose: bool) -> bool {
+        self.color_ok(wall, loose) && self.mood_ok(wall)
+    }
+}
+
 /// Envelope for responses with a `wallpapers` field.
 #[derive(Debug, Deserialize)]
 struct WallpapersWrapper {
@@ -322,59 +370,106 @@ pub fn query(
     Ok(wrapper.wallpapers)
 }
 
-/// Build a candidate pool for a category/color filter.
+/// Build a candidate pool for category/color/mood filters.
 ///
 /// The plain `/wallpapers` filter endpoint returns very few results (e.g. a
 /// single wallpaper for `color=black`), which makes repeat avoidance useless.
-/// Prefer the search endpoint — it carries color metadata and a much larger
-/// pool — then filter locally. Falls back to the plain endpoint if search has
-/// nothing usable.
-pub fn filtered(
+/// Prefer the search endpoint — it carries color/mood metadata and a much
+/// larger pool. Each requested color/mood seeds its own search, the results
+/// are merged, then filtered locally by all criteria.
+pub fn discover(
     category: Option<&str>,
-    color: Option<&str>,
+    filters: Filters<'_>,
     count: u32,
 ) -> Result<Vec<WallpaperEntry>, String> {
-    if let Some(c) = color {
-        let needle = c.trim().to_lowercase();
-        if !needle.is_empty() {
-            if let Ok(results) = search(&needle, count) {
-                let exact: Vec<WallpaperEntry> = results
-                    .iter()
-                    .filter(|w| w.has_primary_color(&needle))
-                    .cloned()
-                    .collect();
-                let mut pool = if exact.is_empty() {
-                    results
-                        .into_iter()
-                        .filter(|w| w.matches_color(&needle))
-                        .collect()
-                } else {
-                    exact
-                };
+    fn dedup(items: Vec<WallpaperEntry>) -> Vec<WallpaperEntry> {
+        let mut seen = HashSet::new();
+        items.into_iter().filter(|w| seen.insert(w.id())).collect()
+    }
 
-                if let Some(cat) = category {
-                    let by_category: Vec<WallpaperEntry> = pool
-                        .iter()
-                        .filter(|w| {
-                            w.category()
-                                .as_deref()
-                                .is_some_and(|wc| wc.eq_ignore_ascii_case(cat))
-                        })
-                        .cloned()
-                        .collect();
-                    if !by_category.is_empty() {
-                        pool = by_category;
-                    }
-                }
+    fn select(
+        pool: &[WallpaperEntry],
+        category: Option<&str>,
+        filters: Filters<'_>,
+        loose: bool,
+    ) -> Vec<WallpaperEntry> {
+        pool.iter()
+            .filter(|w| {
+                let cat_ok = category
+                    .map(|c| {
+                        w.category()
+                            .as_deref()
+                            .is_some_and(|wc| wc.eq_ignore_ascii_case(c))
+                    })
+                    .unwrap_or(true);
+                cat_ok && filters.matches(w, loose)
+            })
+            .cloned()
+            .collect()
+    }
 
-                if !pool.is_empty() {
-                    return Ok(pool);
-                }
+    let mut seeds: Vec<String> = filters
+        .colors
+        .iter()
+        .chain(filters.moods.iter())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_lowercase())
+        .collect();
+    if let Some(cat) = category {
+        seeds.push(cat.to_string());
+    }
+    if seeds.is_empty() {
+        seeds.push("art".to_string());
+    }
+
+    let mut pool = Vec::new();
+    let mut last_err = None;
+    for seed in &seeds {
+        match search(seed, count) {
+            Ok(items) => pool.extend(items),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let pool = dedup(pool);
+
+    let mut result = select(&pool, category, filters, false);
+    if result.is_empty() {
+        result = select(&pool, category, filters, true);
+    }
+
+    if result.is_empty() {
+        // Mood-only queries in particular can miss the seed terms; broaden with
+        // generic searches, which still carry color/mood metadata.
+        let mut extra = Vec::new();
+        for seed in ["art", "nature", "minimal", "dark"] {
+            if let Ok(items) = search(seed, count) {
+                extra.extend(items);
+            }
+        }
+        let extra = dedup(extra);
+        result = select(&extra, category, filters, false);
+        if result.is_empty() {
+            result = select(&extra, category, filters, true);
+        }
+    }
+
+    if !result.is_empty() {
+        return Ok(result);
+    }
+
+    // Last resort for color-only filters: the legacy plain filter endpoint.
+    if filters.moods.is_empty() {
+        if let Ok(items) = query(category, filters.colors.first().map(|s| s.as_str()), count) {
+            if !items.is_empty() {
+                return Ok(items);
             }
         }
     }
 
-    query(category, color, count)
+    match last_err {
+        Some(e) => Err(e),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Fetch random mobile wallpapers using the dedicated random API.
@@ -514,6 +609,31 @@ mod tests {
     #[test]
     fn candidates_normalizes_inner_whitespace() {
         assert_eq!(search_candidates("monkey\t d\nluffy"), vec!["monkey-d-luffy", "monkey d luffy", "monkeydluffy"]);
+    }
+
+    #[test]
+    fn filters_support_any_and_all_colors_and_moods() {
+        let entry: WallpaperEntry = serde_json::from_str(
+            r#"{
+                "file_name": "x",
+                "data": { "primary_colors": ["black", "white"], "mood": "calm" }
+            }"#,
+        )
+        .unwrap();
+        let black = vec!["black".to_string()];
+        let black_white = vec!["black".to_string(), "white".to_string()];
+        let black_red = vec!["black".to_string(), "red".to_string()];
+        let moods = vec!["calm".to_string(), "dreamy".to_string()];
+
+        let any = Filters { colors: &black_white, moods: &[], match_all: false };
+        let all = Filters { colors: &black_white, moods: &[], match_all: true };
+        let missing = Filters { colors: &black_red, moods: &[], match_all: true };
+        let with_mood = Filters { colors: &black, moods: &moods, match_all: false };
+
+        assert!(any.matches(&entry, false));
+        assert!(all.matches(&entry, false));
+        assert!(!missing.matches(&entry, false));
+        assert!(with_mood.matches(&entry, false));
     }
 
     #[test]

@@ -8,7 +8,7 @@ Fast, intelligent wallpaper setter for Android via Termux. Powered by [WallWidgy
 - **Smart Cropping**: Intelligently centers horizontally while preserving the top 35% vertically so characters, faces, skies, and horizons are never cut off.
 - **Fit Modes**: Choose between `smart`, `cover` (symmetrical center), and `contain_blur` (0% cropped, ambient blurred backdrop).
 - **Auto-Config Setup**: Automatically generates a clean, well-commented configuration on first launch — no interactive prompts blocking headless crons.
-- **Filters & Search**: Pick by category (`-c`), filter by color (`-C`), or search by title/tag (`-s`).
+- **Filters & Search**: Pick by category (`-c`), filter by one or more colors (`-C black,white`) and moods (`-m calm,dreamy`), or search by title/tag (`-s`).
 - **Priority & Blacklist**: Bias random mode towards your favorite aesthetics and block unwanted categories/colors.
 - **No Repeats**: Remembers the last 500 applied wallpapers so search, random, category, color and local modes never pick the same one twice. Once the pool is exhausted, older wallpapers recycle in — never the one you just saw.
 
@@ -47,19 +47,35 @@ wall -c amoled
 # Filter by color (e.g. blue, red, orange, black)
 wall -C blue
 
+# Multiple colors (any match by default), comma-separated or repeated
+wall -C black,white
+wall -C black -C white
+wall -C "black, white"
+
+# Require ALL listed colors (AND) instead of any (OR)
+wall -C black,white --match all
+wall -C black,white --match and
+
+# Filter by mood (any listed mood matches); combinable with colors and categories
+wall -m calm
+wall -m intense,dreamy -C purple
+wall -c anime -m melancholic --match all
+
 # Combine category + color
 wall -c art -C blue
 
 # Search by title or keyword (an unseen match is used)
 wall -s "cat"
 wall -s "cyberpunk skyline"
+wall -s luffy -C blue
 
-# List categories and colors with your priority and blacklist status
+# List categories, colors and moods with your priority and blacklist status
 wall -l
 
-# List official categories and supported colors
+# List official categories, supported colors and moods
 wall --categories
 wall --colors
+wall --moods
 
 # View active configuration and screen resolution
 wall --info
@@ -116,6 +132,17 @@ blacklist_colors = []
 # Optional fallback folder when running `wall --local`
 # walls_dir = "/sdcard/Pictures/Wallpapers"
 ```
+
+### Color & Mood Filters
+
+`-C` and `-m` each accept one value, a comma-separated list, or repeated flags. Values are case-insensitive and whitespace around commas is ignored.
+
+- `--match any` (default, alias `or`): a wallpaper matches if **any** listed color is among its primary colors.
+- `--match all` (alias `and`): a wallpaper must have **all** listed colors among its primary colors (e.g. a black-and-white wallpaper).
+- Multiple moods always match **any** of the listed moods, since each wallpaper has a single mood.
+- Color, mood, category and search filters combine with AND. Run `wall --colors` and `wall --moods` to see the supported values.
+
+Colors and moods are matched against WallWidgy's metadata, so filters build a large candidate pool from the search endpoint — which also lets the no-repeat history do its job.
 
 ### Resetting Configuration
 

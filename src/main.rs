@@ -9,14 +9,25 @@ mod image_proc;
 mod setter;
 mod update;
 
-use api::WallpaperEntry;
-use clap::Parser;
+use api::{Filters, WallpaperEntry};
+use clap::{Parser, ValueEnum};
 use config::Config;
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::process::ExitCode;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
+
+/// How to combine multiple color filters.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MatchMode {
+    /// Any listed color may match (OR).
+    #[value(alias = "or")]
+    Any,
+    /// Every listed color must match (AND).
+    #[value(alias = "and")]
+    All,
+}
 
 /// Intelligent Android wallpaper setter powered by WallWidgy.
 #[derive(Parser)]
@@ -30,9 +41,17 @@ struct Cli {
     #[arg(short = 'c', long = "category", value_name = "NAME")]
     category: Option<String>,
 
-    /// Filter wallpapers by color (e.g. blue, purple, black, neon). Combinable with -c.
-    #[arg(short = 'C', long = "color", value_name = "COLOR")]
-    color: Option<String>,
+    /// Filter by one or more colors, comma-separated or repeatable (e.g. -C black,white).
+    #[arg(short = 'C', long = "color", num_args(1..), value_name = "COLOR")]
+    color_values: Vec<String>,
+
+    /// Filter by one or more moods, comma-separated or repeatable (e.g. -m calm,dreamy).
+    #[arg(short = 'm', long = "mood", num_args(1..), value_name = "MOOD")]
+    mood_values: Vec<String>,
+
+    /// Combine multiple colors with any (OR) or all (AND). mood always uses any.
+    #[arg(long = "match", value_enum, default_value = "any")]
+    match_mode: MatchMode,
 
     /// Search for a wallpaper by keyword or title (an unseen match is selected).
     #[arg(short = 's', long = "search", num_args(1..), value_name = "QUERY")]
@@ -49,6 +68,10 @@ struct Cli {
     /// List all supported color filters.
     #[arg(long = "colors")]
     colors: bool,
+
+    /// List all supported mood filters.
+    #[arg(long = "moods")]
+    moods: bool,
 
     /// Reset configuration file to the clean default template.
     #[arg(long = "reset-config")]
@@ -87,7 +110,7 @@ struct Cli {
 
 fn run_category(
     cat: &str,
-    color: Option<&str>,
+    filters: Filters<'_>,
     cfg: &Config,
     count: u32,
     dry_run: bool,
@@ -96,25 +119,21 @@ fn run_category(
     if cfg.is_blacklisted(cat) {
         return Err(format!("Category '{cat}' is blacklisted in your config."));
     }
-    if let Some(c) = color {
-        if cfg.is_color_blacklisted(c) {
-            return Err(format!("Color '{c}' is blacklisted in your config."));
-        }
-    }
+    check_color_blacklist(filters.colors, cfg)?;
 
     eprint!("Fetching wallpapers from category: {cat}");
-    if let Some(c) = color {
-        eprint!(", color: {c}");
+    if !filters.colors.is_empty() {
+        eprint!(", color: {}", filters.colors.join(", "));
+    }
+    if !filters.moods.is_empty() {
+        eprint!(", mood: {}", filters.moods.join(", "));
     }
     eprintln!("...");
 
-    let walls = api::filtered(Some(cat), color, count)?;
+    let mut walls = api::discover(Some(cat), filters, count)?;
+    walls.retain(|w| !w.has_blacklisted_color(&cfg.filter.blacklist_colors));
     if walls.is_empty() {
-        if let Some(c) = color {
-            return Err(format!("No wallpapers found for category '{cat}' with color '{c}'"));
-        } else {
-            return Err(format!("No wallpapers found for category '{cat}'"));
-        }
+        return Err(format!("No wallpapers found for category '{cat}' with the requested filters."));
     }
 
     let wall = pick_unseen(walls, history, &mut rand::thread_rng()).ok_or("Empty pool")?;
@@ -122,28 +141,35 @@ fn run_category(
 }
 
 fn run_color(
-    color: &str,
+    filters: Filters<'_>,
     cfg: &Config,
     count: u32,
     dry_run: bool,
     history: &mut history::History,
 ) -> Result<(), String> {
-    if cfg.is_color_blacklisted(color) {
-        return Err(format!("Color '{color}' is blacklisted in your config."));
+    check_color_blacklist(filters.colors, cfg)?;
+
+    if filters.colors.is_empty() {
+        eprintln!("Fetching wallpapers with mood: {}...", filters.moods.join(", "));
+    } else {
+        eprint!("Fetching wallpapers with color: {}", filters.colors.join(", "));
+        if filters.match_all {
+            eprint!(" (all)");
+        }
+        eprintln!("...");
+        if !filters.moods.is_empty() {
+            eprintln!("  Mood: {}", filters.moods.join(", "));
+        }
     }
 
-    eprintln!("Fetching wallpapers with color: {color}...");
-    let mut walls = api::filtered(None, Some(color), count)?;
+    let mut walls = api::discover(None, filters, count)?;
     walls.retain(|w| {
-        if let Some(c) = w.category() {
-            !cfg.is_blacklisted(&c)
-        } else {
-            true
-        }
+        let cat_ok = w.category().map(|c| !cfg.is_blacklisted(&c)).unwrap_or(true);
+        cat_ok && !w.has_blacklisted_color(&cfg.filter.blacklist_colors)
     });
 
     if walls.is_empty() {
-        return Err(format!("No wallpapers found for color '{color}'"));
+        return Err("No wallpapers found matching the requested filters.".into());
     }
 
     let wall = pick_unseen(walls, history, &mut rand::thread_rng()).ok_or("Empty pool")?;
@@ -152,30 +178,24 @@ fn run_color(
 
 fn run_search(
     query: &str,
-    color: Option<&str>,
+    filters: Filters<'_>,
     cfg: &Config,
     count: u32,
     dry_run: bool,
     history: &mut history::History,
 ) -> Result<(), String> {
+    check_color_blacklist(filters.colors, cfg)?;
+
     eprintln!("Searching WallWidgy for: \"{query}\"...");
     let mut walls = api::search(query, count)?;
     walls.retain(|w| {
         let cat_ok = w.category().map(|c| !cfg.is_blacklisted(&c)).unwrap_or(true);
         let col_bl_ok = !w.has_blacklisted_color(&cfg.filter.blacklist_colors);
-        let col_match_ok = if let Some(c) = color {
-            w.matches_color(c)
-        } else {
-            true
-        };
-        cat_ok && col_bl_ok && col_match_ok
+        cat_ok && col_bl_ok && filters.matches(w, true)
     });
 
     if walls.is_empty() {
-        if let Some(c) = color {
-            return Err(format!("No wallpapers matched query \"{query}\" with color \"{c}\""));
-        }
-        return Err(format!("No wallpapers matched query: \"{query}\""));
+        return Err(format!("No wallpapers matched query \"{query}\" with the requested filters."));
     }
 
     let wall = pick_unseen(walls, history, &mut rand::thread_rng()).ok_or("Empty pool")?;
@@ -218,7 +238,13 @@ fn run_random(
                 }
                 eprintln!();
 
-                if let Ok(walls) = api::filtered(cat, col, count) {
+                let col_values: Vec<String> = col.map(|c| vec![c.to_string()]).unwrap_or_default();
+                let filters = Filters {
+                    colors: &col_values,
+                    moods: &[],
+                    match_all: false,
+                };
+                if let Ok(walls) = api::discover(cat, filters, count) {
                     let filtered: Vec<_> = walls
                         .into_iter()
                         .filter(|w| {
@@ -363,6 +389,30 @@ fn run_info(cfg: &Config, history: &history::History) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Split comma-separated CLI values (also accepts repeated flags) into a clean,
+/// deduplicated, lowercase list.
+fn parse_multi(values: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        for part in value.split(',') {
+            let part = part.trim().to_lowercase();
+            if !part.is_empty() && !out.contains(&part) {
+                out.push(part);
+            }
+        }
+    }
+    out
+}
+
+fn check_color_blacklist(colors: &[String], cfg: &Config) -> Result<(), String> {
+    for c in colors {
+        if cfg.is_color_blacklisted(c) {
+            return Err(format!("Color '{c}' is blacklisted in your config."));
+        }
+    }
+    Ok(())
+}
 
 /// Pick a wallpaper that has not been applied yet. Once the whole pool has been
 /// seen, recycle it but exclude the single most recently applied wallpaper so
@@ -560,6 +610,14 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if cli.moods {
+        println!("Supported WallWidgy moods:");
+        for m in api::MOODS {
+            println!("  • {m}");
+        }
+        return ExitCode::SUCCESS;
+    }
+
     // Load or automatically initialize configuration on first run
     let (cfg, is_new) = match Config::load_or_create() {
         Ok(res) => res,
@@ -591,26 +649,24 @@ fn main() -> ExitCode {
     }
 
     let search_query = cli.search.map(|words| words.join(" "));
+    let colors = parse_multi(&cli.color_values);
+    let moods = parse_multi(&cli.mood_values);
+    let filters = Filters {
+        colors: &colors,
+        moods: &moods,
+        match_all: matches!(cli.match_mode, MatchMode::All),
+    };
 
     let result = if let Some(ref query) = search_query {
-        run_search(
-            query,
-            cli.color.as_deref(),
-            &cfg,
-            cli.count,
-            cli.dry_run,
-            &mut history,
-        )
+        run_search(query, filters, &cfg, cli.count, cli.dry_run, &mut history)
     } else if cli.local {
         run_local(&cfg, cli.dry_run, &mut history)
+    } else if let Some(cat) = cli.category.as_deref() {
+        run_category(cat, filters, &cfg, cli.count, cli.dry_run, &mut history)
+    } else if !colors.is_empty() || !moods.is_empty() {
+        run_color(filters, &cfg, cli.count, cli.dry_run, &mut history)
     } else {
-        match (cli.category.as_deref(), cli.color.as_deref()) {
-            (Some(cat), color) => {
-                run_category(cat, color, &cfg, cli.count, cli.dry_run, &mut history)
-            }
-            (None, Some(color)) => run_color(color, &cfg, cli.count, cli.dry_run, &mut history),
-            (None, None) => run_random(&cfg, cli.count, cli.dry_run, &mut history),
-        }
+        run_random(&cfg, cli.count, cli.dry_run, &mut history)
     };
 
     match result {
@@ -619,5 +675,21 @@ fn main() -> ExitCode {
             eprintln!("Error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_multi_handles_commas_spaces_and_repeats() {
+        let values = vec![
+            "black, white".to_string(),
+            "blue,".to_string(),
+            String::new(),
+            "BLACK".to_string(),
+        ];
+        assert_eq!(parse_multi(&values), vec!["black", "white", "blue"]);
     }
 }
