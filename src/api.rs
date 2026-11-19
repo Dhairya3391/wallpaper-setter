@@ -148,6 +148,34 @@ impl WallpaperEntry {
         }
     }
 
+    /// Stable identity used to dedupe wallpapers that have already been applied.
+    /// Prefers the API's public id / filename fields so the same wallpaper keeps
+    /// the same key across searches and repeated calls.
+    pub fn id(&self) -> String {
+        let raw = match self {
+            WallpaperEntry::Url(u) => u.as_str(),
+            WallpaperEntry::Object {
+                name,
+                file_main_name,
+                file_name,
+                download_url,
+                ..
+            } => name
+                .as_deref()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| file_main_name.as_deref().filter(|v| !v.trim().is_empty()))
+                .or_else(|| file_name.as_deref().filter(|v| !v.trim().is_empty()))
+                .or_else(|| download_url.as_deref().filter(|v| !v.trim().is_empty()))
+                .unwrap_or(""),
+        };
+        let key = raw.trim().to_lowercase();
+        if key.is_empty() {
+            self.title().trim().to_lowercase()
+        } else {
+            key
+        }
+    }
+
     /// Category if available (strips leading `#`).
     pub fn category(&self) -> Option<String> {
         match self {
@@ -425,6 +453,20 @@ mod tests {
     #[test]
     fn candidates_normalizes_inner_whitespace() {
         assert_eq!(search_candidates("monkey\t d\nluffy"), vec!["monkey-d-luffy", "monkey d luffy", "monkeydluffy"]);
+    }
+
+    #[test]
+    fn id_prefers_public_id_and_is_normalized() {
+        let entry: WallpaperEntry = serde_json::from_str(
+            r#"{
+                "name": "Luffy-Gear-Five",
+                "file_name": "some-file.png",
+                "download_url": "https://example.com/other.png",
+                "category": "amoled"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(entry.id(), "luffy-gear-five");
     }
 
     #[test]

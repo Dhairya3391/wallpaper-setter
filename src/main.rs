@@ -4,6 +4,7 @@
 
 mod api;
 mod config;
+mod history;
 mod image_proc;
 mod setter;
 mod update;
@@ -12,6 +13,7 @@ use api::WallpaperEntry;
 use clap::Parser;
 use config::Config;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use std::process::ExitCode;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -32,7 +34,7 @@ struct Cli {
     #[arg(short = 'C', long = "color", value_name = "COLOR")]
     color: Option<String>,
 
-    /// Search for a wallpaper by keyword or title (first match is selected).
+    /// Search for a wallpaper by keyword or title (an unseen match is selected).
     #[arg(short = 's', long = "search", num_args(1..), value_name = "QUERY")]
     search: Option<Vec<String>>,
 
@@ -51,6 +53,10 @@ struct Cli {
     /// Reset configuration file to the clean default template.
     #[arg(long = "reset-config")]
     reset_config: bool,
+
+    /// Clear the list of wallpapers that have already been applied.
+    #[arg(long = "reset-history")]
+    reset_history: bool,
 
     /// Print configuration file path.
     #[arg(long = "config")]
@@ -85,6 +91,7 @@ fn run_category(
     cfg: &Config,
     count: u32,
     dry_run: bool,
+    history: &mut history::History,
 ) -> Result<(), String> {
     if cfg.is_blacklisted(cat) {
         return Err(format!("Category '{cat}' is blacklisted in your config."));
@@ -110,11 +117,17 @@ fn run_category(
         }
     }
 
-    let wall = walls.choose(&mut rand::thread_rng()).ok_or("Empty pool")?;
-    download_process_set(wall, cfg, dry_run)
+    let wall = pick_unseen(walls, history, &mut rand::thread_rng()).ok_or("Empty pool")?;
+    download_process_set(&wall, cfg, dry_run, history)
 }
 
-fn run_color(color: &str, cfg: &Config, count: u32, dry_run: bool) -> Result<(), String> {
+fn run_color(
+    color: &str,
+    cfg: &Config,
+    count: u32,
+    dry_run: bool,
+    history: &mut history::History,
+) -> Result<(), String> {
     if cfg.is_color_blacklisted(color) {
         return Err(format!("Color '{color}' is blacklisted in your config."));
     }
@@ -133,8 +146,8 @@ fn run_color(color: &str, cfg: &Config, count: u32, dry_run: bool) -> Result<(),
         return Err(format!("No wallpapers found for color '{color}'"));
     }
 
-    let wall = walls.choose(&mut rand::thread_rng()).ok_or("Empty pool")?;
-    download_process_set(wall, cfg, dry_run)
+    let wall = pick_unseen(walls, history, &mut rand::thread_rng()).ok_or("Empty pool")?;
+    download_process_set(&wall, cfg, dry_run, history)
 }
 
 fn run_search(
@@ -143,6 +156,7 @@ fn run_search(
     cfg: &Config,
     count: u32,
     dry_run: bool,
+    history: &mut history::History,
 ) -> Result<(), String> {
     eprintln!("Searching WallWidgy for: \"{query}\"...");
     let mut walls = api::search(query, count)?;
@@ -164,12 +178,16 @@ fn run_search(
         return Err(format!("No wallpapers matched query: \"{query}\""));
     }
 
-    // First match as requested
-    let wall = &walls[0];
-    download_process_set(wall, cfg, dry_run)
+    let wall = pick_unseen(walls, history, &mut rand::thread_rng()).ok_or("Empty pool")?;
+    download_process_set(&wall, cfg, dry_run, history)
 }
 
-fn run_random(cfg: &Config, count: u32, dry_run: bool) -> Result<(), String> {
+fn run_random(
+    cfg: &Config,
+    count: u32,
+    dry_run: bool,
+    history: &mut history::History,
+) -> Result<(), String> {
     eprintln!("Fetching random wallpaper...");
 
     let mut rng = rand::thread_rng();
@@ -207,8 +225,8 @@ fn run_random(cfg: &Config, count: u32, dry_run: bool) -> Result<(), String> {
                             w.category().map(|c| !cfg.is_blacklisted(&c)).unwrap_or(true)
                         })
                         .collect();
-                    if let Some(wall) = filtered.choose(&mut rng) {
-                        return download_process_set(wall, cfg, dry_run);
+                    if let Some(wall) = pick_unseen(filtered, history, &mut rng) {
+                        return download_process_set(&wall, cfg, dry_run, history);
                     }
                 }
             }
@@ -224,14 +242,14 @@ fn run_random(cfg: &Config, count: u32, dry_run: bool) -> Result<(), String> {
         })
         .collect();
 
-    if let Some(wall) = filtered.choose(&mut rng) {
-        return download_process_set(wall, cfg, dry_run);
+    if let Some(wall) = pick_unseen(filtered, history, &mut rng) {
+        return download_process_set(&wall, cfg, dry_run, history);
     }
 
     Err("Could not retrieve a valid random wallpaper. Please try again.".into())
 }
 
-fn run_local(cfg: &Config, dry_run: bool) -> Result<(), String> {
+fn run_local(cfg: &Config, dry_run: bool, history: &mut history::History) -> Result<(), String> {
     let dir = cfg
         .source
         .walls_dir
@@ -248,7 +266,27 @@ fn run_local(cfg: &Config, dry_run: bool) -> Result<(), String> {
         return Err(format!("No supported images found in {}", dir.display()));
     }
 
-    let path = walls.choose(&mut rand::thread_rng()).unwrap();
+    let mut rng = rand::thread_rng();
+    let unseen: Vec<&std::path::PathBuf> = walls
+        .iter()
+        .filter(|p| !history.contains(&local_id(p)))
+        .collect();
+    let chosen = if let Some(p) = unseen.choose(&mut rng) {
+        Some(*p)
+    } else {
+        eprintln!("  ↻ All local wallpapers already applied; recycling older ones.");
+        let last = history.last().unwrap_or("");
+        let recycled: Vec<&std::path::PathBuf> = walls
+            .iter()
+            .filter(|p| local_id(p) != last)
+            .collect();
+        recycled
+            .choose(&mut rng)
+            .copied()
+            .or_else(|| walls.first())
+    };
+
+    let path = chosen.ok_or("Empty pool")?;
     eprintln!("Local: {}", path.display());
 
     let image = image_proc::process_file(path, cfg.screen.width, cfg.screen.height, &cfg.fit.mode)
@@ -260,6 +298,10 @@ fn run_local(cfg: &Config, dry_run: bool) -> Result<(), String> {
     }
 
     setter::set_wallpaper(&image, &config::cache_dir())?;
+    history.record(&local_id(path));
+    if let Err(e) = history.save() {
+        eprintln!("  Warning: could not save wallpaper history: {e}");
+    }
     println!("OK  {}", path.file_name().unwrap_or_default().to_string_lossy());
     Ok(())
 }
@@ -299,7 +341,7 @@ fn run_list(cfg: &Config) {
     }
 }
 
-fn run_info(cfg: &Config) {
+fn run_info(cfg: &Config, history: &history::History) {
     println!("wall configuration info:");
     println!("  Config path : {}", config::config_path().display());
     println!("  Resolution  : {}x{} px", cfg.screen.width, cfg.screen.height);
@@ -308,6 +350,11 @@ fn run_info(cfg: &Config) {
     println!("  Priority    : {:?}", cfg.filter.priority);
     println!("  Colors      : {:?}", cfg.filter.colors);
     println!("  Blacklist C : {:?}", cfg.filter.blacklist_colors);
+    println!(
+        "  Applied     : {} wallpaper(s) in {}",
+        history.len(),
+        history.path().display()
+    );
     if let Some(ref dir) = cfg.source.walls_dir {
         println!("  Local dir   : {dir}");
     }
@@ -315,7 +362,53 @@ fn run_info(cfg: &Config) {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn download_process_set(wall: &WallpaperEntry, cfg: &Config, dry_run: bool) -> Result<(), String> {
+/// Pick a wallpaper that has not been applied yet. Once the whole pool has been
+/// seen, recycle it but exclude the single most recently applied wallpaper so
+/// the same image never appears twice in a row.
+fn pick_unseen<R: Rng>(
+    walls: Vec<WallpaperEntry>,
+    history: &history::History,
+    rng: &mut R,
+) -> Option<WallpaperEntry> {
+    if walls.is_empty() {
+        return None;
+    }
+
+    let unseen: Vec<WallpaperEntry> = walls
+        .iter()
+        .filter(|w| !history.contains(&w.id()))
+        .cloned()
+        .collect();
+    if let Some(pick) = unseen.choose(rng) {
+        return Some(pick.clone());
+    }
+
+    eprintln!("  ↻ All candidates already applied; recycling older wallpapers.");
+    let last = history.last().unwrap_or("");
+    let first = walls.first().cloned();
+    let recycled: Vec<WallpaperEntry> = walls
+        .into_iter()
+        .filter(|w| w.id() != last)
+        .collect();
+    if let Some(pick) = recycled.choose(rng) {
+        return Some(pick.clone());
+    }
+
+    eprintln!("  ↻ Only one candidate available; reapplying it. Use --reset-history to start fresh.");
+    first
+}
+
+/// Stable key for a local wallpaper file.
+fn local_id(path: &std::path::Path) -> String {
+    path.to_string_lossy().trim().to_lowercase()
+}
+
+fn download_process_set(
+    wall: &WallpaperEntry,
+    cfg: &Config,
+    dry_run: bool,
+    history: &mut history::History,
+) -> Result<(), String> {
     let url = wall
         .download_url()
         .ok_or("Wallpaper does not have a valid download URL")?;
@@ -362,6 +455,11 @@ fn download_process_set(wall: &WallpaperEntry, cfg: &Config, dry_run: bool) -> R
     }
 
     setter::set_wallpaper(&image, &config::cache_dir())?;
+
+    history.record(&wall.id());
+    if let Err(e) = history.save() {
+        eprintln!("  Warning: could not save wallpaper history: {e}");
+    }
     println!("OK  {title}");
     Ok(())
 }
@@ -428,6 +526,23 @@ fn main() -> ExitCode {
         }
     }
 
+    if cli.reset_history {
+        let mut h = history::History::load();
+        return match h.clear() {
+            Ok(()) => {
+                println!(
+                    "Applied wallpaper history cleared ({})",
+                    config::history_path().display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("Failed to reset history: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if cli.categories {
         println!("Official WallWidgy categories:");
         for c in api::OFFICIAL_CATEGORIES {
@@ -462,8 +577,10 @@ fn main() -> ExitCode {
         );
     }
 
+    let mut history = history::History::load();
+
     if cli.info {
-        run_info(&cfg);
+        run_info(&cfg, &history);
         return ExitCode::SUCCESS;
     }
 
@@ -475,14 +592,23 @@ fn main() -> ExitCode {
     let search_query = cli.search.map(|words| words.join(" "));
 
     let result = if let Some(ref query) = search_query {
-        run_search(query, cli.color.as_deref(), &cfg, cli.count, cli.dry_run)
+        run_search(
+            query,
+            cli.color.as_deref(),
+            &cfg,
+            cli.count,
+            cli.dry_run,
+            &mut history,
+        )
     } else if cli.local {
-        run_local(&cfg, cli.dry_run)
+        run_local(&cfg, cli.dry_run, &mut history)
     } else {
         match (cli.category.as_deref(), cli.color.as_deref()) {
-            (Some(cat), color) => run_category(cat, color, &cfg, cli.count, cli.dry_run),
-            (None, Some(color)) => run_color(color, &cfg, cli.count, cli.dry_run),
-            (None, None) => run_random(&cfg, cli.count, cli.dry_run),
+            (Some(cat), color) => {
+                run_category(cat, color, &cfg, cli.count, cli.dry_run, &mut history)
+            }
+            (None, Some(color)) => run_color(color, &cfg, cli.count, cli.dry_run, &mut history),
+            (None, None) => run_random(&cfg, cli.count, cli.dry_run, &mut history),
         }
     };
 

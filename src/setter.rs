@@ -14,13 +14,23 @@ pub fn temp_path(cache_dir: &Path) -> PathBuf {
 }
 
 fn run_termux_wallpaper(args: &[&OsStr]) -> Result<(), String> {
-    let status = Command::new("termux-wallpaper")
+    // Capture the child's output: termux-wallpaper prints its own
+    // "Wallpaper set successfully!" line, which would otherwise appear once per
+    // call (home + lock screen). Our single `OK <name>` line is the confirmation.
+    let output = Command::new("termux-wallpaper")
         .args(args)
-        .status()
+        .output()
         .map_err(|e| format!("could not run termux-wallpaper: {e}"))?;
 
-    if !status.success() {
-        return Err(format!("termux-wallpaper exited with {status}"));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err(format!("termux-wallpaper exited with {}", output.status));
+        }
+        return Err(format!(
+            "termux-wallpaper exited with {}: {stderr}",
+            output.status
+        ));
     }
     Ok(())
 }

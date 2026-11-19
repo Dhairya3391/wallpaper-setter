@@ -10,6 +10,7 @@ Fast, intelligent wallpaper setter for Android via Termux. Powered by [WallWidgy
 - **Auto-Config Setup**: Automatically generates a clean, well-commented configuration on first launch — no interactive prompts blocking headless crons.
 - **Filters & Search**: Pick by category (`-c`), filter by color (`-C`), or search by title/tag (`-s`).
 - **Priority & Blacklist**: Bias random mode towards your favorite aesthetics and block unwanted categories/colors.
+- **No Repeats**: Remembers the last 500 applied wallpapers so search, random, category, color and local modes never pick the same one twice. Once the pool is exhausted, older wallpapers recycle in — never the one you just saw.
 
 ## Requirements
 
@@ -49,7 +50,7 @@ wall -C blue
 # Combine category + color
 wall -c art -C blue
 
-# Search by title or keyword (first mobile match is used)
+# Search by title or keyword (an unseen match is used)
 wall -s "cat"
 wall -s "cyberpunk skyline"
 
@@ -69,6 +70,9 @@ wall -u
 
 # Reset config.toml to the default template
 wall --reset-config
+
+# Forget all applied wallpapers (allows previously used ones again)
+wall --reset-history
 
 # Test without applying to wallpaper (great for testing)
 wall --dry-run -c amoled
@@ -120,6 +124,16 @@ To restore the default configuration template at any time:
 ```sh
 wall --reset-config
 ```
+
+### Resetting Applied Wallpaper History
+
+Applied wallpapers are recorded in `~/.cache/wall/history.json` (up to the last 500). Use `wall --info` to see how many are recorded. To forget them all and allow previously used wallpapers to be picked again:
+
+```sh
+wall --reset-history
+```
+
+If every candidate has already been applied, older wallpapers are recycled automatically — the most recently applied one is always skipped so you never see the same wallpaper twice in a row.
 
 ## Scheduling
 

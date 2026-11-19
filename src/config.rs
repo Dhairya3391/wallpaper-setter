@@ -101,6 +101,11 @@ pub fn cache_dir() -> PathBuf {
         .join(CONFIG_DIR_NAME)
 }
 
+/// Path to the persisted list of applied wallpapers.
+pub fn history_path() -> PathBuf {
+    cache_dir().join("history.json")
+}
+
 /// Detect screen resolution dynamically (e.g. from Android `wm size`), or fallback to 1080x2400.
 pub fn detect_screen_resolution() -> (u32, u32) {
     if let Ok(output) = std::process::Command::new("wm").arg("size").output() {
